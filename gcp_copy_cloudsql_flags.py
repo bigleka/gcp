@@ -67,6 +67,12 @@ db_logs = []
 creds = None
 flag_vars = []
 
+# essas variáveis precisam ser criadas depois do root existir, então serão inicializadas dentro do app
+def init_service_vars(root):
+    global service_type_left, service_type_right
+    service_type_left = tk.StringVar(root, value="cloudsql")
+    service_type_right = tk.StringVar(root, value="cloudsql")
+
 # Log visual
 def log_message(msg):
     db_logs.append(msg)
@@ -88,18 +94,57 @@ def get_projects():
     response = requests.get(url, headers=headers)
     return [project['projectId'] for project in response.json().get('projects', [])]
 
-def get_instances(project_id):
+# Cloud SQL
+def get_sql_instances(project_id):
     headers = {"Authorization": f"Bearer {creds.token}"}
     url = f"https://sqladmin.googleapis.com/v1/projects/{project_id}/instances"
     response = requests.get(url, headers=headers)
-    return [instance['name'] for instance in response.json().get('items', [])]
+    items = response.json().get('items', [])
+    log_message(f"Encontradas {len(items)} instâncias Cloud SQL no projeto {project_id}.")
+    return [instance['name'] for instance in items]
 
-def get_instance_flags(project_id, instance_id):
+def get_sql_flags(project_id, instance_id):
     headers = {"Authorization": f"Bearer {creds.token}"}
     url = f"https://sqladmin.googleapis.com/v1/projects/{project_id}/instances/{instance_id}"
     response = requests.get(url, headers=headers)
     data = response.json()
     return data.get('settings', {}).get('databaseFlags', [])
+
+# AlloyDB
+def get_alloydb_instances(project_id):
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    url = f"https://alloydb.googleapis.com/v1/projects/{project_id}/locations/-/clusters"
+    response = requests.get(url, headers=headers)
+    clusters = response.json().get('clusters', [])
+    instances = []
+    log_message(f"Encontrados {len(clusters)} clusters AlloyDB no projeto {project_id}.")
+    for cluster in clusters:
+        cluster_name = cluster['name']
+        resp2 = requests.get(f"https://alloydb.googleapis.com/v1/{cluster_name}/instances", headers=headers)
+        inst_list = resp2.json().get('instances', [])
+        log_message(f"Cluster {cluster_name} possui {len(inst_list)} instâncias.")
+        for inst in inst_list:
+            instances.append(inst['name'])
+    log_message(f"Total de {len(instances)} instâncias AlloyDB encontradas no projeto {project_id}.")
+    return instances
+
+def get_alloydb_flags(project_id, instance_fullname):
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    url = f"https://alloydb.googleapis.com/v1/{instance_fullname}"
+    response = requests.get(url, headers=headers)
+    data = response.json()
+    # AlloyDB retorna databaseFlags como dict simples {flag: valor}
+    raw_flags = data.get('databaseFlags', {})
+    flags = []
+    if isinstance(raw_flags, dict):
+        for k, v in raw_flags.items():
+            flags.append({"name": k, "value": v})
+    elif isinstance(raw_flags, list):
+        # fallback caso seja lista de objetos
+        for f in raw_flags:
+            if isinstance(f, dict):
+                flags.append({"name": f.get('name'), "value": f.get('value')})
+    return flags
 
 # Interface de Flags com Checkbuttons e destaque
 select_all_var = None
@@ -145,7 +190,10 @@ def load_flags():
         return
     project_id = left_project_selector.get_selected_project()
     instance_id = left_instance_dropdown.get()
-    flags = get_instance_flags(project_id, instance_id)
+    if service_type_left.get() == "cloudsql":
+        flags = get_sql_flags(project_id, instance_id)
+    else:
+        flags = get_alloydb_flags(project_id, instance_id)
     display_flags(flags)
     log_message(f"Carregadas {len(flags)} flags da instância {instance_id}.")
 
@@ -169,12 +217,15 @@ def apply_flags_to_instance():
     if not confirm:
         return
 
-    headers = {
-        "Authorization": f"Bearer {creds.token}",
-        "Content-Type": "application/json"
-    }
-    url = f"https://sqladmin.googleapis.com/v1/projects/{target_project}/instances/{target_instance}?updateMask=settings.databaseFlags"
-    data = {"settings": {"databaseFlags": selected_flags}}
+    headers = {"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"}
+    if service_type_right.get() == "cloudsql":
+        url = f"https://sqladmin.googleapis.com/v1/projects/{target_project}/instances/{target_instance}?updateMask=settings.databaseFlags"
+        data = {"settings": {"databaseFlags": selected_flags}}
+    else:
+        # AlloyDB espera dict simples
+        data = {"databaseFlags": {f['name']: f['value'] for f in selected_flags}}
+        url = f"https://alloydb.googleapis.com/v1/{target_instance}?updateMask=databaseFlags"
+
     response = requests.patch(url, headers=headers, json=data)
 
     if response.status_code == 200:
@@ -193,22 +244,40 @@ def load_credentials():
         left_project_selector.set_projects(projects)
         right_project_selector.set_projects(projects)
 
-def update_instances_dropdown(project_selector, instance_dropdown):
-    instances = get_instances(project_selector.get_selected_project())
+def update_instances_dropdown(project_selector, instance_dropdown, service_type):
+    project = project_selector.get_selected_project()
+    if not project:
+        return
+    if service_type.get() == "cloudsql":
+        instances = get_sql_instances(project)
+    else:
+        instances = get_alloydb_instances(project)
     instance_dropdown["values"] = sorted(instances)
     instance_dropdown["state"] = "readonly"
+    if instances:
+        instance_dropdown.current(0)
+    log_message(f"{len(instances)} instâncias carregadas para o serviço {service_type.get()} no projeto {project}.")
 
 def on_left_project_selected(project_id):
-    update_instances_dropdown(left_project_selector, left_instance_dropdown)
+    update_instances_dropdown(left_project_selector, left_instance_dropdown, service_type_left)
 
 def on_right_project_selected(project_id):
-    update_instances_dropdown(right_project_selector, right_instance_dropdown)
+    update_instances_dropdown(right_project_selector, right_instance_dropdown, service_type_right)
+
+def on_left_service_changed(event):
+    update_instances_dropdown(left_project_selector, left_instance_dropdown, service_type_left)
+
+def on_right_service_changed(event):
+    update_instances_dropdown(right_project_selector, right_instance_dropdown, service_type_right)
 
 # App Principal
 app = ttk.Window(themename="darkly")
-app.title("GCP Flag Copier Utility")
-app.geometry("650x1000")
-app.resizable(False, True)
+app.title("GCP Flag Copier Utility (Cloud SQL + AlloyDB)")
+app.geometry("650x950")
+app.resizable(True, True)
+
+# inicializa variáveis dependentes de root
+init_service_vars(app)
 
 main_frame = ttk.Frame(app, padding=20)
 main_frame.pack(fill=BOTH, expand=True)
@@ -222,6 +291,10 @@ right_panel.grid(row=0, column=1, padx=10, pady=10, sticky=N)
 left_project_selector = ProjectSelector(left_panel, on_left_project_selected)
 left_project_selector.pack(fill=BOTH, pady=5)
 
+left_service_dropdown = ttk.Combobox(left_panel, values=["cloudsql", "alloydb"], textvariable=service_type_left, state="readonly")
+left_service_dropdown.pack(fill=X, pady=5)
+left_service_dropdown.bind("<<ComboboxSelected>>", on_left_service_changed)
+
 left_instance_dropdown = ttk.Combobox(left_panel, state='disabled')
 left_instance_dropdown.pack(fill=X, pady=5)
 
@@ -229,6 +302,10 @@ ttk.Button(left_panel, text="Carregar Flags", bootstyle=PRIMARY, command=load_fl
 
 right_project_selector = ProjectSelector(right_panel, on_right_project_selected)
 right_project_selector.pack(fill=BOTH, pady=5)
+
+right_service_dropdown = ttk.Combobox(right_panel, values=["cloudsql", "alloydb"], textvariable=service_type_right, state="readonly")
+right_service_dropdown.pack(fill=X, pady=5)
+right_service_dropdown.bind("<<ComboboxSelected>>", on_right_service_changed)
 
 right_instance_dropdown = ttk.Combobox(right_panel, state='disabled')
 right_instance_dropdown.pack(fill=X, pady=5)
@@ -255,7 +332,7 @@ flags_canvas.create_window((0, 0), window=flags_canvas_frame, anchor="nw")
 log_frame = ttk.Labelframe(main_frame, text="Logs", padding=10)
 log_frame.grid(row=3, column=0, columnspan=2, sticky=W+E, padx=10, pady=10)
 
-log_listbox = tk.Listbox(log_frame, width=70, height=10, font=("Segoe UI", 10))
+log_listbox = tk.Listbox(log_frame, width=70, height=5, font=("Segoe UI", 10))
 log_listbox.pack(side=tk.LEFT, fill=BOTH, expand=True)
 
 log_scroll = ttk.Scrollbar(log_frame, orient=VERTICAL, command=log_listbox.yview)
