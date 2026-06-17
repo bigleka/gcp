@@ -31,8 +31,6 @@ Melhorias:
 
 import streamlit as st
 import requests
-import time
-import traceback
 import psycopg2
 import psycopg2.extras
 from datetime import datetime
@@ -41,8 +39,8 @@ from google.oauth2.credentials import Credentials
 from google.auth import default as google_default
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="Cloud SQL Multi-Project Enhanced", layout="wide")
-st.title("🧭 Cloud SQL / AlloyDB Multi-Project — Projetos + Histórico + Status")
+st.set_page_config(page_title="Cloud SQL Multi-Project", layout="wide")
+st.title("🧭 Cloud SQL / AlloyDB Multi-Project — Status via Databases API")
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
@@ -62,7 +60,7 @@ def try_adc_local():
     return creds, project
 
 # -----------------------------
-# API: CloudSQL / AlloyDB listing
+# API listagem
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def list_all_projects(_creds):
@@ -97,6 +95,7 @@ def list_cloudsql_instances_for_project(_creds, project_id):
             "ipAddresses": it.get("ipAddresses", []),
             "labels": it.get("settings", {}).get("userLabels", {}),
             "databaseVersion": it.get("databaseVersion"),
+            "real_status": "UNKNOWN",
         }
         for it in items
     ]
@@ -118,6 +117,7 @@ def list_alloydb_clusters_for_project(_creds, project_id):
             "ipAddresses": [],
             "labels": c.get("labels", {}),
             "databaseVersion": c.get("databaseVersion"),
+            "real_status": "UNKNOWN",
         }
         for c in clusters
     ]
@@ -137,21 +137,30 @@ def list_all_instances_for_all_projects(_creds):
     return all_instances
 
 # -----------------------------
-# Databases via Cloud SQL Admin API
+# Listar databases e status real
 # -----------------------------
 def list_databases_via_api(inst, creds):
+    """Retorna databases e define status real"""
     if inst["type"] != "cloudsql":
-        return []
+        return [], "UNKNOWN"
     headers = {"Authorization": f"Bearer {creds.token}"}
     url = f"https://sqladmin.googleapis.com/v1/projects/{inst['project']}/instances/{inst['name']}/databases"
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        return []
-    data = r.json().get("items", [])
-    ignore = {"template0", "template1", "cloudsqladmin"}
-    return sorted([d["name"] for d in data if d["name"] not in ignore])
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return [], "OFFLINE"
+        data = r.json().get("items", [])
+        ignore = {"template0", "template1", "cloudsqladmin"}
+        dbs = sorted([d["name"] for d in data if d["name"] not in ignore])
+        if dbs:
+            return dbs, "ONLINE"
+        else:
+            return [], "OFFLINE"
+    except Exception:
+        return [], "OFFLINE"
 
 def list_databases_parallel(insts, creds, max_workers=10):
+    """Lista databases e atualiza status em paralelo"""
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(list_databases_via_api, i, creds): i for i in insts}
@@ -159,9 +168,10 @@ def list_databases_parallel(insts, creds, max_workers=10):
             inst = futs[fut]
             key = f"{inst['project']}|{inst['name']}"
             try:
-                results[key] = fut.result()
+                dbs, status = fut.result()
+                results[key] = {"dbs": dbs, "status": status}
             except Exception:
-                results[key] = []
+                results[key] = {"dbs": [], "status": "OFFLINE"}
     return results
 
 # -----------------------------
@@ -199,7 +209,7 @@ def run_sql_on_instance(inst, user, password, db, sql, timeout=10):
     return out
 
 # -----------------------------
-# Session state init
+# Session state
 # -----------------------------
 if "instances_cache" not in st.session_state:
     st.session_state.instances_cache = None
@@ -209,9 +219,11 @@ if "databases_cache" not in st.session_state:
     st.session_state.databases_cache = {}
 if "query_history" not in st.session_state:
     st.session_state.query_history = []
+if "expanders_state" not in st.session_state:
+    st.session_state.expanders_state = {}
 
 # -----------------------------
-# Sidebar - Histórico de queries
+# Sidebar - Histórico
 # -----------------------------
 with st.sidebar.expander("📜 Histórico de queries", expanded=False):
     if st.session_state.query_history:
@@ -261,14 +273,11 @@ if list_btn:
         st.error(f"Erro: {e}")
 
 # -----------------------------
-# Exibição das instâncias agrupadas
+# Exibição agrupada
 # -----------------------------
 if st.session_state.instances_cache:
     creds = st.session_state.creds_cache
     insts = st.session_state.instances_cache
-
-    def is_online(i):
-        return (i["state"] or "").upper() in ("RUNNABLE", "READY", "RUNNING")
 
     grouped = {}
     for inst in insts:
@@ -280,17 +289,23 @@ if st.session_state.instances_cache:
             dbmap = list_databases_parallel(all_flat, creds)
         for k, v in dbmap.items():
             st.session_state.databases_cache[k] = v
-        st.success("Bases listadas com sucesso.")
+        st.success("Bases e status atualizados com sucesso.")
 
     selected = []
     st.markdown("### ☁️ Instâncias por projeto")
 
     for proj, inst_list in grouped.items():
-        with st.expander(f"📦 Projeto `{proj}` ({len(inst_list)} instâncias)", expanded=False):
+        exp_key = f"exp_{proj}"
+        expanded_state = st.session_state.expanders_state.get(exp_key, False)
+        with st.expander(f"📦 Projeto `{proj}` ({len(inst_list)} instâncias)", expanded=expanded_state):
+            st.session_state.expanders_state[exp_key] = True
             for inst in inst_list:
                 cols = st.columns([4, 1, 3, 3, 3])
-                online_flag = is_online(inst)
+                key = f"{inst['project']}|{inst['name']}"
+                cache_data = st.session_state.databases_cache.get(key, {"dbs": [], "status": "UNKNOWN"})
+                online_flag = cache_data["status"] == "ONLINE"
                 status_icon = "🟢" if online_flag else "🔴"
+
                 with cols[0]:
                     st.write(f"{status_icon} **{inst['name']}**")
                     st.caption(f"{inst['type']} • {inst.get('databaseVersion','')}")
@@ -298,8 +313,7 @@ if st.session_state.instances_cache:
                     chk = st.checkbox("", key=f"{inst['project']}|{inst['name']}")
                 with cols[2]:
                     st.write(choose_ip_for_instance(inst) or "---")
-                key = f"{inst['project']}|{inst['name']}"
-                dbs = st.session_state.databases_cache.get(key, [])
+                dbs = cache_data["dbs"]
                 with cols[3]:
                     if dbs:
                         st.selectbox("DB", dbs, key=f"dbsel|{key}", label_visibility="collapsed")
@@ -359,7 +373,7 @@ if st.session_state.instances_cache:
                 else:
                     st.error(r.get("error"))
 
-            # Adicionar ao histórico
+            # Adicionar histórico
             st.session_state.query_history.append({
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "sql": sql.strip(),
